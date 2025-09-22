@@ -7,72 +7,81 @@ from selenium.webdriver.support import expected_conditions as EC
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-import os
-import sys
+import urllib.parse
 
 # Tu clave de API de Google Maps
-api_key = "TU_CLAVE_DE_API_AQUI"
-
-# Redirigir stdout y stderr para suprimir mensajes no deseados
-original_stdout = sys.stdout
-original_stderr = sys.stderr
-sys.stdout = open(os.devnull, 'w')
-sys.stderr = open(os.devnull, 'w')
+api_key = "TU_API_KEY_AQUI"
 
 # Cargar archivo Excel
-archivo = "df_añadido.xlsx"
-# Leer el archivo Excel
+archivo = "df_caribe.xlsx"
 df = pd.read_excel(archivo)
-nit = df["nit"][0]
 
-# Restaurar stdout temporalmente para mostrar solo el NIT de prueba
-sys.stdout = original_stdout
-sys.stderr = original_stderr
-print("NIT de prueba:", nit)
-sys.stdout = open(os.devnull, 'w')
-sys.stderr = open(os.devnull, 'w')
-
-# Configurar Chrome en modo invisible con opciones para suprimir logs
+# Configurar Chrome en modo headless y sin logs
 options = Options()
-options.add_argument("--headless")  # Navegador sin interfaz
+options.add_argument("--headless")
 options.add_argument("--disable-logging")
 options.add_argument("--log-level=3")
 options.add_experimental_option('excludeSwitches', ['enable-logging'])
 driver = webdriver.Chrome(options=options)
 
-# Contadores para resultados
+# Contadores
 exitosos = 0
 fallidos = 0
 
-# Crear barra de progreso silenciosa
-nits_a_procesar = df["nit"][0:10]
+# Subconjunto de NITs a procesar, dentro de ese rango, dejar solo donde latitud sea NaN
+rango = df.iloc[25000:]
+nits_a_procesar = rango[rango["latitud"].isna()].index.tolist()
 
-# Restaurar stdout para la barra de progreso
-sys.stdout = original_stdout
-sys.stderr = original_stderr
+print(f"NITs a procesar: {len(nits_a_procesar)}")
 pbar = tqdm(total=len(nits_a_procesar), desc="Procesando", unit="NIT", ncols=75)
-sys.stdout = open(os.devnull, 'w')
-sys.stderr = open(os.devnull, 'w')
 
-for nit in nits_a_procesar:
-    driver.get(f"https://edirectorio.net/home/search?q={nit}")
 
-    try:
-        # Esperar a que aparezca el botón
-        boton = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "a.custom-btn.btn"))
-        )
 
-        # Obtener el link del botón "Explora"
-        link = boton.get_attribute("href")
+for n, nit in enumerate(nits_a_procesar):
 
-        # Ir directamente al link de la empresa
+    direccion = df.at[nit, 'direccion']
+    ciudad = df.at[nit, 'ciudad']
+    departamento = df.at[nit, 'departamento']
+
+    # Unir en un solo string (ignorando NaN)
+    partes = [str(x) for x in [direccion, ciudad, departamento] if pd.notna(x)]
+    direccion_1 = ", ".join(partes)
+
+    data = {}
+
+    if pd.isna(direccion):
+        try:
+            driver.get(f"https://edirectorio.net/home/search?q={nit}")
+
+            # Esperar botón "Explora"
+            boton = WebDriverWait(driver, 2).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "a.custom-btn.btn")) 
+            )
+
+            link = boton.get_attribute("href")  # Se toma solo después de localizar
+
+        except Exception as e:
+            try:
+                driver.get(f"https://edirectorio.net/home/search?q={nit//10}")
+
+                # Esperar botón "Explora"
+                boton = WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "a.custom-btn.btn")) 
+                )
+
+                link = boton.get_attribute("href")  # Se toma solo después de localizar
+
+            except Exception as e:
+                fallidos += 1
+                #print(f"❌ Error en NIT {nit}: {e}")
+                pbar.update(1)
+                continue
+
         driver.get(link)
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
         Actividad = driver.find_element(By.CSS_SELECTOR, "p.mb-0 a.badge.badge-level")
 
-        data = {}
         for p in soup.select("p.mb-1"):
             strong = p.find("strong")
             if strong:
@@ -82,53 +91,50 @@ for nit in nits_a_procesar:
 
         data["Actividad_economica_principal"] = Actividad.text.strip()
 
-        direccion = f"{data.get('Dirección')}, {data.get('Ciudad')}, Colombia"
+        try:
+            telefono = driver.execute_script("return document.getElementById('phoneHidden').textContent;")
+        except:
+            telefono = ""
 
-        # Extraer directamente el texto del span oculto
-        telefono = driver.execute_script("return document.getElementById('phoneHidden').textContent;")
+        direccion_1 = f"{data.get('Dirección')}, {data.get('Ciudad')}, {data.get('Departamento')}"
 
-        # Geocodificación con Google Maps API
+        df.at[nit, 'razon_social'] = data.get("Razón Social")
+        df.at[nit, 'direccion'] = data.get("Dirección")
+        df.at[nit, 'ciudad'] = data.get("Ciudad")
+        df.at[nit, 'departamento'] = data.get("Departamento")
+        df.at[nit, 'telefono'] = telefono.strip()
+        df.at[nit, 'sector'] = data.get("Actividad_economica_principal")
 
-        url = f"https://maps.googleapis.com/maps/api/geocode/json?address={direccion}&key={api_key}"
+    direccion_encoded = urllib.parse.quote(direccion_1)
 
-        respuesta = requests.get(url).json()
+    # Geocodificación con Google Maps
+    url = f"https://maps.googleapis.com/maps/api/geocode/json?address={direccion_encoded}&key={api_key}"
+    respuesta = requests.get(url).json()
 
-        if respuesta['status'] == 'OK':
-            ubicacion = respuesta['results'][0]['geometry']['location']
-            data['latitud'] = ubicacion['lat']
-            data['longitud'] = ubicacion['lng']
-            exitosos += 1
-        else:
-            fallidos += 1
-
-        df.loc[df['nit'] == nit, 'razon_social'] = data.get("Razón Social")
-        df.loc[df['nit'] == nit, 'direccion'] = data.get("Dirección")
-        df.loc[df['nit'] == nit, 'ciudad'] = data.get("Ciudad")
-        df.loc[df['nit'] == nit, 'departamento'] = data.get("Departamento")
-        df.loc[df['nit'] == nit, 'telefono'] = telefono.strip()
-        df.loc[df['nit'] == nit, 'sector'] = data.get("Actividad_economica_principal")
-        df.loc[df['nit'] == nit, 'latitud'] = data.get("latitud")
-        df.loc[df['nit'] == nit, 'longitud'] = data.get("longitud")
-
-        
-    except Exception as e:
+    if respuesta['status'] == 'OK':
+        ubicacion = respuesta['results'][0]['geometry']['location']
+        data['latitud'] = ubicacion['lat']
+        data['longitud'] = ubicacion['lng']
+        exitosos += 1
+    else:
         fallidos += 1
-    
-    # Actualizar barra de progreso
-    sys.stdout = original_stdout
-    sys.stderr = original_stderr
-    pbar.update(1)
-    sys.stdout = open(os.devnull, 'w')
-    sys.stderr = open(os.devnull, 'w')
-    #time.sleep(0.1)
+        #print(f"❌ NIT {nit} - Dirección: {direccion}")
+        #print(f"⚠️ No se pudo geocodificar: {respuesta.get('status')}")
 
-# Cerrar barra de progreso y driver
-sys.stdout = original_stdout
-sys.stderr = original_stderr
+    # Guardar en el dataframe
+    df.loc[df['nit'] == nit, 'latitud'] = data.get("latitud")
+    df.loc[df['nit'] == nit, 'longitud'] = data.get("longitud")
+
+    if n % 1000 == 0 and n != 0:
+        df.to_excel("df_caribe.xlsx", index=False)
+
+    pbar.update(1)
+
 pbar.close()
 driver.quit()
+df.to_excel("df_caribe.xlsx", index=False)
 
-# Mostrar resumen al final
+# Resumen final
 print("\n" + "="*50)
 print("RESUMEN DE PROCESAMIENTO")
 print("="*50)
@@ -136,9 +142,3 @@ print(f"NITs procesados exitosamente: {exitosos}")
 print(f"NITs con errores: {fallidos}")
 print(f"Total de NITs procesados: {exitosos + fallidos}")
 print("="*50)
-
-df.to_excel("df_enriquecido.xlsx", index=False)
-
-# Restaurar stdout y stderr completamente
-sys.stdout = original_stdout
-sys.stderr = original_stderr
